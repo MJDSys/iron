@@ -6,8 +6,7 @@ use std::net::{ToSocketAddrs, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{future, Future, BoxFuture, Sink, Stream};
-use futures::sync::mpsc;
+use futures::{future, Future, BoxFuture, Stream};
 use futures_cpupool::CpuPool;
 
 use tokio_core::io::Io;
@@ -129,7 +128,7 @@ impl<H: Handler> Iron<H> {
         let core = Core::new().unwrap();
         let handle = core.handle();
 
-        let sock = TcpListener::bind(&addr, &handle).unwrap().incoming();
+        let sock = TcpListener::bind(&addr, &handle).unwrap().incoming().map(|v| future::ok(v));
 
         return self.listen(sock, addr, Protocol::https(), core, handle);
     }
@@ -138,7 +137,7 @@ impl<H: Handler> Iron<H> {
     ///
     /// Call this once to begin listening for requests on the server.
     pub fn https<A, Tls>(self, addr: A, tls: Tls) -> HttpResult<()>
-        where A: ToSocketAddrs, Tls: TlsAcceptorExt + 'static
+        where A: ToSocketAddrs, Tls: TlsAcceptorExt
     {
         let addr = addr.to_socket_addrs()?.next().unwrap();
 
@@ -147,21 +146,10 @@ impl<H: Handler> Iron<H> {
 
         let listener_tcp = TcpListener::bind(&addr, &handle).unwrap();
 
-        let (tx, rx) = mpsc::channel(1);
-
-        let ssl_acceptor = listener_tcp.incoming().for_each(move |(sock, remote_addr)| {
-            let tx = tx.clone();
+        let listener = listener_tcp.incoming().map(|(sock, remote_addr)| {
             tls.accept_async(sock).map_err(|e| IoError::new(ErrorKind::Other, e)).and_then(move |sock| {
                 future::ok((sock, remote_addr))
-            }).then(|r| {
-                tx.send(r).map_err(|e| IoError::new(ErrorKind::Other, e))
-            }).and_then(|_| future::ok(()))
-        }).then(|_| future::ok(()));
-        handle.spawn(ssl_acceptor);
-
-        let listener = rx.then(|r| match r {
-            Ok(real_r) => real_r,
-            Err(e) => panic!(e),
+            })
         });
 
         return self.listen(listener, addr, Protocol::https(), core, handle);
@@ -170,9 +158,10 @@ impl<H: Handler> Iron<H> {
     /// Kick off a server process on an arbitrary `Listener`.
     ///
     /// Most use cases may call `http` and `https` methods instead of this.
-    pub fn listen<L, S>(self, listener: L, addr: SocketAddr, protocol: Protocol, mut core: Core, handle: Handle) -> HttpResult<()>
-        where L: Stream<Item=(S, SocketAddr), Error=IoError>,
+    pub fn listen<L, F, S>(self, listener: L, addr: SocketAddr, protocol: Protocol, mut core: Core, handle: Handle) -> HttpResult<()>
+        where L: Stream<Item=F, Error=IoError>,
         S: Io + 'static,
+        F: Future<Item=(S, SocketAddr), Error=IoError>
     {
         let handler = RawService{
             addr: addr,
@@ -182,10 +171,10 @@ impl<H: Handler> Iron<H> {
         };
 
         let http = Http::new();
-        let server = listener.for_each(|(sock, remote_addr)| {
+        let server = listener.for_each(|sock_future| sock_future.and_then(|(sock, remote_addr)| {
             http.bind_connection(&handle, sock, remote_addr, handler.new_service().unwrap());
             future::ok(())
-        });
+        }));
 
         core.run(server).map_err(|e| e.into())
     }
